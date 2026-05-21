@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Personal Flight Radar</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0b1220; color: #f8fafc; }
+    #app { height: 100%; display: flex; flex-direction: column; }
+    header { padding: 14px 16px; background: rgba(15, 23, 42, 0.96); border-bottom: 1px solid rgba(148, 163, 184, 0.25); z-index: 1000; }
+    h1 { margin: 0 0 10px; font-size: 1.25rem; }
+    .controls { display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 10px; align-items: center; }
+    button, select { border: 0; border-radius: 12px; padding: 12px 14px; font-weight: 700; font-size: 0.95rem; cursor: pointer; }
+    button { background: #38bdf8; color: #031525; }
+    button.secondary { background: #f8fafc; color: #0f172a; }
+    select { background: #f8fafc; color: #0f172a; width: 100%; }
+    .status { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; font-size: 0.9rem; color: #cbd5e1; }
+    .pill { background: rgba(148, 163, 184, 0.12); border: 1px solid rgba(148, 163, 184, 0.25); border-radius: 999px; padding: 6px 10px; }
+    #message { color: #fca5a5; margin-top: 8px; min-height: 20px; }
+    #map { flex: 1; width: 100%; min-height: 400px; background: #111827; }
+    .legend { position: absolute; right: 14px; bottom: 24px; z-index: 900; background: rgba(15, 23, 42, 0.92); color: #e2e8f0; padding: 10px 12px; border-radius: 12px; border: 1px solid rgba(148,163,184,.35); font-size: 12px; line-height: 1.4; }
+    .legend-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+    .swatch { width: 22px; height: 4px; border-radius: 999px; display: inline-block; }
+    .aircraft-icon { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 50%; background: rgba(15, 23, 42, 0.85); border: 1px solid rgba(255,255,255,.45); box-shadow: 0 6px 18px rgba(0,0,0,.3); font-size: 20px; }
+    .aircraft-label { color: white; text-shadow: 0 1px 4px #000; font-size: 11px; margin-top: 2px; text-align: center; white-space: nowrap; }
+    .popup { color: #0f172a; font-size: 13px; }
+    .popup strong { font-size: 15px; }
+    @media (max-width: 850px) { .controls { grid-template-columns: 1fr 1fr; } header { padding: 10px; } h1 { font-size: 1.1rem; } }
+    @media (max-width: 520px) { .controls { grid-template-columns: 1fr; } button, select { padding: 11px; } .legend { left: 10px; right: auto; bottom: 18px; } }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>Personal Flight Radar</h1>
+      <div class="controls">
+        <button id="locateBtn">Use My Location</button>
+        <button id="refreshBtn" class="secondary">Refresh</button>
+        <button id="autoBtn" class="secondary">Auto Refresh: Off</button>
+        <select id="radiusSelect">
+          <option value="25">25 miles</option>
+          <option value="50" selected>50 miles</option>
+          <option value="100">100 miles</option>
+          <option value="150">150 miles</option>
+        </select>
+        <select id="trailSelect">
+          <option value="5">Trail: 5 points</option>
+          <option value="10" selected>Trail: 10 points</option>
+          <option value="20">Trail: 20 points</option>
+          <option value="40">Trail: 40 points</option>
+        </select>
+      </div>
+      <div id="message"></div>
+      <div class="status">
+        <span class="pill" id="aircraftCount">Aircraft: 0</span>
+        <span class="pill" id="lastUpdated">Last updated: Never</span>
+        <span class="pill">Source: ADSB.lol with OpenSky fallback</span>
+      </div>
+    </header>
+    <div id="map"></div>
+  </div>
+
+  <div class="legend">
+    <strong>Trail altitude</strong>
+    <div class="legend-row"><span class="swatch" style="background:#22c55e"></span> Low / ground to 5k ft</div>
+    <div class="legend-row"><span class="swatch" style="background:#f59e0b"></span> 5k–15k ft</div>
+    <div class="legend-row"><span class="swatch" style="background:#3b82f6"></span> 15k–30k ft</div>
+    <div class="legend-row"><span class="swatch" style="background:#a855f7"></span> 30k+ ft</div>
+    <div style="margin-top:6px; opacity:.85;">Icons: ✈ jet · 🛩 small · 🚁 helicopter</div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const map = L.map('map', { zoomControl: true }).setView([40.76, -111.89], 8);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 18,
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    let userLat = 40.76;
+    let userLon = -111.89;
+    let autoTimer = null;
+    const markers = new Map();
+    const trails = new Map();
+    const trailLines = new Map();
+
+    const msg = document.getElementById('message');
+    const countEl = document.getElementById('aircraftCount');
+    const updatedEl = document.getElementById('lastUpdated');
+
+    function milesToDegrees(miles) { return miles / 69; }
+    function clean(v) { return v === null || v === undefined || v === '' ? 'Unknown' : v; }
+    function nowTime() { return new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' }); }
+    function altitudeColor(altFt) {
+      if (!Number.isFinite(altFt)) return '#94a3b8';
+      if (altFt < 5000) return '#22c55e';
+      if (altFt < 15000) return '#f59e0b';
+      if (altFt < 30000) return '#3b82f6';
+      return '#a855f7';
+    }
+
+    function inferAircraft(ac) {
+      const cat = (ac.category || ac.t || ac.type || '').toString().toUpperCase();
+      const desc = (ac.desc || ac.description || '').toString().toUpperCase();
+      const combined = cat + ' ' + desc;
+      if (combined.includes('HELI') || combined.includes('ROTOR') || cat === 'A7') return { icon: '🚁', type: 'Helicopter' };
+      if (combined.includes('GLIDER')) return { icon: '🪂', type: 'Glider' };
+      if (combined.includes('SMALL') || cat === 'A1' || cat === 'A2' || cat === 'A3') return { icon: '🛩', type: 'Small aircraft' };
+      if (combined.includes('JET') || cat === 'A4' || cat === 'A5' || cat === 'A6' || cat === 'A8') return { icon: '✈', type: 'Jet / airliner' };
+      return { icon: '✈', type: 'Aircraft' };
+    }
+
+    function makeIcon(ac, heading) {
+      const info = inferAircraft(ac);
+      return L.divIcon({
+        className: '',
+        html: `<div class="aircraft-icon" style="transform: rotate(${heading || 0}deg)"><span style="display:inline-block; transform: rotate(-${heading || 0}deg)">${info.icon}</span></div><div class="aircraft-label">${(ac.flight || ac.callsign || '').trim()}</div>`,
+        iconSize: [42, 48],
+        iconAnchor: [21, 21]
+      });
+    }
+
+    function normalizeFromAdsbLol(data) {
+      return (data.ac || []).filter(a => Number.isFinite(a.lat) && Number.isFinite(a.lon)).map(a => ({
+        id: a.hex || a.icao || Math.random().toString(36).slice(2),
+        lat: a.lat,
+        lon: a.lon,
+        flight: (a.flight || a.call || '').trim(),
+        altitude: Number.isFinite(a.alt_baro) ? a.alt_baro : a.alt_geom,
+        speed: a.gs,
+        heading: a.track,
+        category: a.category,
+        type: a.t,
+        source: 'ADSB.lol'
+      }));
+    }
+
+    function normalizeFromOpenSky(data) {
+      return (data.states || []).filter(s => Number.isFinite(s[6]) && Number.isFinite(s[5])).map(s => ({
+        id: s[0],
+        flight: (s[1] || '').trim(),
+        lon: s[5],
+        lat: s[6],
+        altitude: Number.isFinite(s[7]) ? Math.round(s[7] * 3.28084) : null,
+        speed: Number.isFinite(s[9]) ? Math.round(s[9] * 1.94384) : null,
+        heading: s[10],
+        category: s[17],
+        source: 'OpenSky'
+      }));
+    }
+
+    async function fetchAircraft() {
+      const radius = Number(document.getElementById('radiusSelect').value);
+      const d = milesToDegrees(radius);
+      const lamin = userLat - d, lamax = userLat + d, lomin = userLon - d, lomax = userLon + d;
+      msg.textContent = 'Loading aircraft...';
+
+      const urls = [
+        `https://api.adsb.lol/v2/lat/${userLat}/lon/${userLon}/dist/${radius}`,
+        `https://opensky-network.org/api/states/all?lamin=${lamin}&lomin=${lomin}&lamax=${lamax}&lomax=${lomax}`
+      ];
+
+      try {
+        let aircraft = [];
+        try {
+          const r1 = await fetch(urls[0], { cache: 'no-store' });
+          if (r1.ok) aircraft = normalizeFromAdsbLol(await r1.json());
+        } catch (e) {}
+
+        if (!aircraft.length) {
+          const r2 = await fetch(urls[1], { cache: 'no-store' });
+          if (!r2.ok) throw new Error('OpenSky request failed');
+          aircraft = normalizeFromOpenSky(await r2.json());
+        }
+
+        drawAircraft(aircraft);
+        msg.textContent = aircraft.length ? '' : 'No aircraft found nearby right now.';
+        countEl.textContent = `Aircraft: ${aircraft.length}`;
+        updatedEl.textContent = `Last updated: ${nowTime()}`;
+      } catch (err) {
+        msg.textContent = 'Could not load aircraft data. Free APIs may be rate-limited, blocked by CORS, or temporarily unavailable.';
+      }
+    }
+
+    function drawAircraft(aircraft) {
+      const seen = new Set();
+      const maxTrail = Number(document.getElementById('trailSelect').value);
+
+      aircraft.forEach(ac => {
+        seen.add(ac.id);
+        const latlng = [ac.lat, ac.lon];
+        const info = inferAircraft(ac);
+        const popup = `<div class="popup"><strong>${clean(ac.flight) || clean(ac.id)}</strong><br>Type: ${info.type}<br>Altitude: ${clean(ac.altitude)} ft<br>Speed: ${clean(ac.speed)} kt<br>Heading: ${clean(ac.heading)}°<br>Source: ${ac.source}</div>`;
+
+        if (!trails.has(ac.id)) trails.set(ac.id, []);
+        const points = trails.get(ac.id);
+        const last = points[points.length - 1];
+        if (!last || last[0] !== ac.lat || last[1] !== ac.lon) points.push([ac.lat, ac.lon, Number(ac.altitude)]);
+        while (points.length > maxTrail) points.shift();
+
+        if (markers.has(ac.id)) {
+          markers.get(ac.id).setLatLng(latlng).setIcon(makeIcon(ac, ac.heading)).bindPopup(popup);
+        } else {
+          const marker = L.marker(latlng, { icon: makeIcon(ac, ac.heading) }).bindPopup(popup).addTo(map);
+          markers.set(ac.id, marker);
+        }
+
+        if (trailLines.has(ac.id)) {
+          trailLines.get(ac.id).forEach(line => map.removeLayer(line));
+        }
+        const segments = [];
+        for (let i = 1; i < points.length; i++) {
+          const avgAlt = ((points[i - 1][2] || 0) + (points[i][2] || 0)) / 2;
+          segments.push(L.polyline([[points[i - 1][0], points[i - 1][1]], [points[i][0], points[i][1]]], {
+            color: altitudeColor(avgAlt), weight: 4, opacity: 0.85
+          }).addTo(map));
+        }
+        trailLines.set(ac.id, segments);
+      });
+
+      for (const [id, marker] of markers.entries()) {
+        if (!seen.has(id)) {
+          map.removeLayer(marker);
+          markers.delete(id);
+        }
+      }
+    }
+
+    document.getElementById('locateBtn').onclick = () => {
+      if (!navigator.geolocation) { msg.textContent = 'Geolocation is not supported by this browser.'; return; }
+      msg.textContent = 'Getting your location...';
+      navigator.geolocation.getCurrentPosition(pos => {
+        userLat = pos.coords.latitude;
+        userLon = pos.coords.longitude;
+        map.setView([userLat, userLon], 9);
+        L.circle([userLat, userLon], { radius: 1200, color: '#38bdf8', fillOpacity: 0.12 }).addTo(map);
+        fetchAircraft();
+      }, () => { msg.textContent = 'Could not get your location. Browser permission may be blocked.'; });
+    };
+
+    document.getElementById('refreshBtn').onclick = fetchAircraft;
+    document.getElementById('radiusSelect').onchange = fetchAircraft;
+    document.getElementById('trailSelect').onchange = () => fetchAircraft();
+    document.getElementById('autoBtn').onclick = () => {
+      const btn = document.getElementById('autoBtn');
+      if (autoTimer) { clearInterval(autoTimer); autoTimer = null; btn.textContent = 'Auto Refresh: Off'; }
+      else { fetchAircraft(); autoTimer = setInterval(fetchAircraft, 20000); btn.textContent = 'Auto Refresh: On'; }
+    };
+
+    fetchAircraft();
+  </script>
+</body>
+</html>
