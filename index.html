@@ -12,23 +12,29 @@
     header { padding: 14px 16px; background: rgba(15, 23, 42, 0.96); border-bottom: 1px solid rgba(148, 163, 184, 0.25); z-index: 1000; }
     h1 { margin: 0 0 10px; font-size: 1.25rem; }
     .controls { display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 10px; align-items: center; }
-    button, select { border: 0; border-radius: 12px; padding: 12px 14px; font-weight: 700; font-size: 0.95rem; cursor: pointer; }
+    button, select, input { border: 0; border-radius: 12px; padding: 12px 14px; font-weight: 700; font-size: 0.95rem; cursor: pointer; }
     button { background: #38bdf8; color: #031525; }
     button.secondary { background: #f8fafc; color: #0f172a; }
-    select { background: #f8fafc; color: #0f172a; width: 100%; }
+    button.ghost { background: rgba(148,163,184,0.18); color: #f8fafc; }
+    select, input { background: #f8fafc; color: #0f172a; width: 100%; cursor: text; }
     .status { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; font-size: 0.9rem; color: #cbd5e1; }
     .pill { background: rgba(148, 163, 184, 0.12); border: 1px solid rgba(148, 163, 184, 0.25); border-radius: 999px; padding: 6px 10px; }
+    .pill.active { background: rgba(56, 189, 248, 0.22); border-color: #38bdf8; color: #e0f2fe; }
     #message { color: #fca5a5; margin-top: 8px; min-height: 20px; }
     #map { flex: 1; width: 100%; min-height: 400px; background: #111827; }
     .legend { position: absolute; right: 14px; bottom: 24px; z-index: 900; background: rgba(15, 23, 42, 0.92); color: #e2e8f0; padding: 10px 12px; border-radius: 12px; border: 1px solid rgba(148,163,184,.35); font-size: 12px; line-height: 1.4; }
     .legend-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
     .swatch { width: 22px; height: 4px; border-radius: 999px; display: inline-block; }
     .aircraft-icon { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 50%; background: rgba(15, 23, 42, 0.85); border: 1px solid rgba(255,255,255,.45); box-shadow: 0 6px 18px rgba(0,0,0,.3); font-size: 20px; }
+    .aircraft-icon.tracked { border: 2px solid #38bdf8; box-shadow: 0 0 0 4px rgba(56,189,248,.35), 0 6px 18px rgba(0,0,0,.3); }
     .aircraft-label { color: white; text-shadow: 0 1px 4px #000; font-size: 11px; margin-top: 2px; text-align: center; white-space: nowrap; }
     .popup { color: #0f172a; font-size: 13px; }
     .popup strong { font-size: 15px; }
+    .track-row { display: flex; gap: 10px; margin-top: 10px; }
+    .track-row input { flex: 2; }
+    .track-row button { flex: 1; white-space: nowrap; }
     @media (max-width: 850px) { .controls { grid-template-columns: 1fr 1fr; } header { padding: 10px; } h1 { font-size: 1.1rem; } }
-    @media (max-width: 520px) { .controls { grid-template-columns: 1fr; } button, select { padding: 11px; } .legend { left: 10px; right: auto; bottom: 18px; } }
+    @media (max-width: 520px) { .controls { grid-template-columns: 1fr; } button, select, input { padding: 11px; } .legend { left: 10px; right: auto; bottom: 18px; } .track-row { flex-direction: column; } }
   </style>
 </head>
 <body>
@@ -52,8 +58,14 @@
           <option value="40">Trail: 40 points</option>
         </select>
       </div>
+      <div class="track-row">
+        <input id="flightInput" type="text" placeholder="Flight number or tail # (e.g. DAL123, N12345)" autocomplete="off" />
+        <button id="trackBtn">Track Flight</button>
+        <button id="clearTrackBtn" class="ghost">Back to My Area</button>
+      </div>
       <div id="message"></div>
       <div class="status">
+        <span class="pill" id="modePill">Mode: My Area</span>
         <span class="pill" id="aircraftCount">Aircraft: 0</span>
         <span class="pill" id="lastUpdated">Last updated: Never</span>
         <span class="pill">Source: ADSB.lol with OpenSky fallback</span>
@@ -82,6 +94,8 @@
     let userLat = 40.76;
     let userLon = -111.89;
     let autoTimer = null;
+    let mode = 'area'; // 'area' | 'track'
+    let trackedFlightId = null; // flight string typed by the user, uppercased/trimmed
     const markers = new Map();
     const trails = new Map();
     const trailLines = new Map();
@@ -89,6 +103,8 @@
     const msg = document.getElementById('message');
     const countEl = document.getElementById('aircraftCount');
     const updatedEl = document.getElementById('lastUpdated');
+    const modePill = document.getElementById('modePill');
+    const flightInput = document.getElementById('flightInput');
 
     function milesToDegrees(miles) { return miles / 69; }
     function clean(v) { return v === null || v === undefined || v === '' ? 'Unknown' : v; }
@@ -112,11 +128,11 @@
       return { icon: '✈', type: 'Aircraft' };
     }
 
-    function makeIcon(ac, heading) {
+    function makeIcon(ac, heading, isTracked) {
       const info = inferAircraft(ac);
       return L.divIcon({
         className: '',
-        html: `<div class="aircraft-icon" style="transform: rotate(${heading || 0}deg)"><span style="display:inline-block; transform: rotate(-${heading || 0}deg)">${info.icon}</span></div><div class="aircraft-label">${(ac.flight || ac.callsign || '').trim()}</div>`,
+        html: `<div class="aircraft-icon${isTracked ? ' tracked' : ''}" style="transform: rotate(${heading || 0}deg)"><span style="display:inline-block; transform: rotate(-${heading || 0}deg)">${info.icon}</span></div><div class="aircraft-label">${(ac.flight || ac.callsign || '').trim()}</div>`,
         iconSize: [42, 48],
         iconAnchor: [21, 21]
       });
@@ -151,7 +167,7 @@
       }));
     }
 
-    async function fetchAircraft() {
+    async function fetchAreaAircraft() {
       const radius = Number(document.getElementById('radiusSelect').value);
       const d = milesToDegrees(radius);
       const lamin = userLat - d, lamax = userLat + d, lomin = userLon - d, lomax = userLon + d;
@@ -175,7 +191,7 @@
           aircraft = normalizeFromOpenSky(await r2.json());
         }
 
-        drawAircraft(aircraft);
+        drawAircraft(aircraft, null);
         msg.textContent = aircraft.length ? '' : 'No aircraft found nearby right now.';
         countEl.textContent = `Aircraft: ${aircraft.length}`;
         updatedEl.textContent = `Last updated: ${nowTime()}`;
@@ -184,12 +200,62 @@
       }
     }
 
-    function drawAircraft(aircraft) {
+    async function fetchTrackedAircraft() {
+      if (!trackedFlightId) return;
+      msg.textContent = `Looking for ${trackedFlightId}...`;
+
+      // ADSB.lol supports lookups by callsign or by registration/tail number.
+      const callsignUrl = `https://api.adsb.lol/v2/callsign/${encodeURIComponent(trackedFlightId)}`;
+      const registrationUrl = `https://api.adsb.lol/v2/registration/${encodeURIComponent(trackedFlightId)}`;
+
+      try {
+        let aircraft = [];
+        try {
+          const r1 = await fetch(callsignUrl, { cache: 'no-store' });
+          if (r1.ok) aircraft = normalizeFromAdsbLol(await r1.json());
+        } catch (e) {}
+
+        if (!aircraft.length) {
+          try {
+            const r2 = await fetch(registrationUrl, { cache: 'no-store' });
+            if (r2.ok) aircraft = normalizeFromAdsbLol(await r2.json());
+          } catch (e) {}
+        }
+
+        if (!aircraft.length) {
+          msg.textContent = `Couldn't find "${trackedFlightId}" right now — it may not be airborne, or hasn't reported a position recently.`;
+          countEl.textContent = 'Aircraft: 0';
+          clearAllMarkers();
+          return;
+        }
+
+        // If multiple aircraft match (rare), just track the first and mention it.
+        const target = aircraft[0];
+        drawAircraft([target], target.id);
+        map.setView([target.lat, target.lon], Math.max(map.getZoom(), 9));
+        msg.textContent = aircraft.length > 1 ? `Found ${aircraft.length} matches, showing the first.` : '';
+        countEl.textContent = 'Aircraft: 1';
+        updatedEl.textContent = `Last updated: ${nowTime()}`;
+      } catch (err) {
+        msg.textContent = 'Could not load tracking data. The flight tracking API may be rate-limited or temporarily unavailable.';
+      }
+    }
+
+    function clearAllMarkers() {
+      for (const marker of markers.values()) map.removeLayer(marker);
+      for (const segs of trailLines.values()) segs.forEach(l => map.removeLayer(l));
+      markers.clear();
+      trailLines.clear();
+      trails.clear();
+    }
+
+    function drawAircraft(aircraft, trackedId) {
       const seen = new Set();
       const maxTrail = Number(document.getElementById('trailSelect').value);
 
       aircraft.forEach(ac => {
         seen.add(ac.id);
+        const isTracked = trackedId !== null && ac.id === trackedId;
         const latlng = [ac.lat, ac.lon];
         const info = inferAircraft(ac);
         const popup = `<div class="popup"><strong>${clean(ac.flight) || clean(ac.id)}</strong><br>Type: ${info.type}<br>Altitude: ${clean(ac.altitude)} ft<br>Speed: ${clean(ac.speed)} kt<br>Heading: ${clean(ac.heading)}°<br>Source: ${ac.source}</div>`;
@@ -201,9 +267,9 @@
         while (points.length > maxTrail) points.shift();
 
         if (markers.has(ac.id)) {
-          markers.get(ac.id).setLatLng(latlng).setIcon(makeIcon(ac, ac.heading)).bindPopup(popup);
+          markers.get(ac.id).setLatLng(latlng).setIcon(makeIcon(ac, ac.heading, isTracked)).bindPopup(popup);
         } else {
-          const marker = L.marker(latlng, { icon: makeIcon(ac, ac.heading) }).bindPopup(popup).addTo(map);
+          const marker = L.marker(latlng, { icon: makeIcon(ac, ac.heading, isTracked) }).bindPopup(popup).addTo(map);
           markers.set(ac.id, marker);
         }
 
@@ -224,8 +290,34 @@
         if (!seen.has(id)) {
           map.removeLayer(marker);
           markers.delete(id);
+          if (trailLines.has(id)) { trailLines.get(id).forEach(l => map.removeLayer(l)); trailLines.delete(id); }
+          trails.delete(id);
         }
       }
+    }
+
+    function refresh() {
+      if (mode === 'track') fetchTrackedAircraft();
+      else fetchAreaAircraft();
+    }
+
+    function enterTrackMode(flightId) {
+      trackedFlightId = flightId.trim().toUpperCase();
+      mode = 'track';
+      modePill.textContent = `Mode: Tracking ${trackedFlightId}`;
+      modePill.classList.add('active');
+      clearAllMarkers();
+      fetchTrackedAircraft();
+    }
+
+    function exitTrackMode() {
+      trackedFlightId = null;
+      mode = 'area';
+      modePill.textContent = 'Mode: My Area';
+      modePill.classList.remove('active');
+      flightInput.value = '';
+      clearAllMarkers();
+      fetchAreaAircraft();
     }
 
     document.getElementById('locateBtn').onclick = () => {
@@ -236,20 +328,30 @@
         userLon = pos.coords.longitude;
         map.setView([userLat, userLon], 9);
         L.circle([userLat, userLon], { radius: 1200, color: '#38bdf8', fillOpacity: 0.12 }).addTo(map);
-        fetchAircraft();
+        if (mode === 'area') fetchAreaAircraft();
       }, () => { msg.textContent = 'Could not get your location. Browser permission may be blocked.'; });
     };
 
-    document.getElementById('refreshBtn').onclick = fetchAircraft;
-    document.getElementById('radiusSelect').onchange = fetchAircraft;
-    document.getElementById('trailSelect').onchange = () => fetchAircraft();
+    document.getElementById('refreshBtn').onclick = refresh;
+    document.getElementById('radiusSelect').onchange = () => { if (mode === 'area') fetchAreaAircraft(); };
+    document.getElementById('trailSelect').onchange = () => refresh();
     document.getElementById('autoBtn').onclick = () => {
       const btn = document.getElementById('autoBtn');
       if (autoTimer) { clearInterval(autoTimer); autoTimer = null; btn.textContent = 'Auto Refresh: Off'; }
-      else { fetchAircraft(); autoTimer = setInterval(fetchAircraft, 20000); btn.textContent = 'Auto Refresh: On'; }
+      else { refresh(); autoTimer = setInterval(refresh, 20000); btn.textContent = 'Auto Refresh: On'; }
     };
 
-    fetchAircraft();
+    document.getElementById('trackBtn').onclick = () => {
+      const val = flightInput.value.trim();
+      if (!val) { msg.textContent = 'Type a flight number or tail number first.'; return; }
+      enterTrackMode(val);
+    };
+    flightInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') document.getElementById('trackBtn').click();
+    });
+    document.getElementById('clearTrackBtn').onclick = exitTrackMode;
+
+    fetchAreaAircraft();
   </script>
 </body>
 </html>
